@@ -3,13 +3,13 @@
  *
  * GitHub Actions Cron から30分ごとに呼び出されるメインポーリングエンドポイント。
  * 処理フロー:
- *   1. ウォッチリスト取得（.env）
+ *   1. Supabase からウォッチリストを取得（未設定時は .env にフォールバック）
  *   2. やのしん TDNet API で直近35分の開示を取得
  *   3. ウォッチリストとマッチング
- *   4. 各マッチに対して: EDINET補完 → Claude要約 → Discord通知
+ *   4. 各マッチに対して: 重複チェック → EDINET補完 → Claude要約 → Discord通知 → DB保存
  *   5. 処理結果を JSON で返す
  *
- * セキュリティ: x-cron-secret ヘッダーで認証（GitHub Actions secrets と照合）
+ * セキュリティ: x-cron-secret ヘッダーで認証
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -18,6 +18,7 @@ import { getRecentDisclosures, isEarningsType } from "@/lib/tdnet";
 import { getEarnings } from "@/lib/edinet";
 import { generateIrSummary } from "@/lib/claude";
 import { sendDiscordNotification } from "@/lib/discord";
+import { supabase } from "@/lib/supabase";
 import type { PollResult } from "@/types";
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
@@ -37,12 +38,27 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     errors: [],
   };
 
-  // ── Step 1: ウォッチリスト取得 ────────────────────────────────────
-  const watchlist = getWatchlistCodes();
+  // ── Step 1: ウォッチリスト取得（Supabase → .envフォールバック）────
+  let watchlist: string[] = [];
+  try {
+    const { data, error } = await supabase
+      .from("watchlists")
+      .select("company_code");
+
+    if (!error && data && data.length > 0) {
+      watchlist = data.map((row) => row.company_code);
+    } else {
+      // Supabaseが空または未設定の場合は .env にフォールバック
+      watchlist = getWatchlistCodes();
+    }
+  } catch {
+    watchlist = getWatchlistCodes();
+  }
+
   if (watchlist.length === 0) {
     return NextResponse.json({
       ...result,
-      message: "WATCHLIST_CODES が未設定です。.env.local を確認してください。",
+      message: "ウォッチリストが空です。管理画面から銘柄を追加してください。",
     });
   }
 
@@ -71,9 +87,23 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     });
   }
 
-  // ── Step 4: 各マッチを処理（EDINET補完 → Claude要約 → Discord通知）
+  // ── Step 4: 各マッチを処理 ────────────────────────────────────────
   for (const disclosure of matched) {
     try {
+      // 重複チェック: 同一開示がすでに通知済みかを確認
+      const { data: existing } = await supabase
+        .from("notifications")
+        .select("id")
+        .eq("company_code", disclosure.companyCode)
+        .eq("doc_title", disclosure.docTitle)
+        .gte("published_at", disclosure.publishedAt.toISOString())
+        .maybeSingle();
+
+      if (existing) {
+        // すでに通知済みなのでスキップ
+        continue;
+      }
+
       // 決算系の開示なら EDINET DB で財務データを補完
       const earnings = isEarningsType(disclosure.docType)
         ? await getEarnings(disclosure.companyCode)
@@ -83,11 +113,25 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const summary = await generateIrSummary(disclosure, earnings);
 
       // Discord Webhook に通知
-      await sendDiscordNotification({ disclosure, summary, earnings: earnings ?? undefined });
+      await sendDiscordNotification({
+        disclosure,
+        summary,
+        earnings: earnings ?? undefined,
+      });
+
+      // Supabase に通知履歴を保存（重複防止 + UI表示用）
+      await supabase.from("notifications").insert({
+        company_code: disclosure.companyCode,
+        company_name: disclosure.companyName,
+        doc_title: disclosure.docTitle,
+        doc_type: disclosure.docType,
+        doc_url: disclosure.docUrl,
+        published_at: disclosure.publishedAt.toISOString(),
+        summary: summary.lines.join("\n"),
+      });
 
       result.notifiedCount++;
 
-      // API レート制限への配慮: 連続する場合は少し待機
       if (matched.length > 1) {
         await sleep(500);
       }
@@ -96,7 +140,6 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const errorDetail = `[${disclosure.companyCode}] ${msg}`;
       result.errors.push(errorDetail);
       console.error("[poll] notification error:", errorDetail);
-      // 1社のエラーで他社の通知を止めない
     }
   }
 
@@ -106,7 +149,6 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   });
 }
 
-/** ミリ秒待機 */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
