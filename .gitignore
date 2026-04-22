@@ -32,6 +32,8 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# テンプレートはコミット対象（実際のキーは含まない）
+!.env.local.example
 
 # vercel
 .vercel

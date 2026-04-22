@@ -1,0 +1,35 @@
+name: IR ポーリング
+
+on:
+  schedule:
+    # 平日（月〜金）7:30〜18:00 JST に30分ごとに実行
+    # GitHub Actions の cron は UTC 基準（JST = UTC+9）
+    # JST 7:30〜18:00 = UTC 22:30〜09:00 (前日22:30 〜 当日09:00)
+    - cron: "*/30 22-23 * * 0-4"   # UTC 22:30, 23:00, 23:30（月曜〜金曜の前夜）
+    - cron: "*/30 0-9 * * 1-5"     # UTC 00:00〜09:00（火〜土の早朝）
+
+  # 手動実行も可能（テスト用）
+  workflow_dispatch:
+
+jobs:
+  poll-ir:
+    name: TDNet ポーリング & Discord 通知
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 適時開示をポーリングして Discord に通知
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${{ secrets.APP_URL }}/api/cron/poll" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json")
+
+          echo "Response status: $RESPONSE"
+
+          if [ "$RESPONSE" != "200" ]; then
+            echo "❌ ポーリング失敗: HTTP $RESPONSE"
+            exit 1
+          fi
+
+          echo "✅ ポーリング完了"
