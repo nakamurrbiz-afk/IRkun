@@ -13,8 +13,9 @@ export function getWatchlistCodes(): string[] {
   const raw = process.env.WATCHLIST_CODES ?? "";
   if (!raw.trim()) return [];
 
+  // カンマ・スペース・改行のいずれでも区切れる（Vercel UIのコンマ入力問題に対応）
   return raw
-    .split(",")
+    .split(/[,\s\n]+/)
     .map((code) => code.trim())
     .filter((code) => code.length > 0);
 }
