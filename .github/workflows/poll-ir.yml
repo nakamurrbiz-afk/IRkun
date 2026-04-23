@@ -20,7 +20,7 @@ jobs:
     steps:
       - name: 適時開示をポーリングして Discord に通知
         run: |
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
             -X POST "${{ secrets.APP_URL }}/api/cron/poll" \
             -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
             -H "Content-Type: application/json")
