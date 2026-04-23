@@ -67,6 +67,8 @@ export async function sendDiscordNotification(
           "",
           "**📝 3行サマリー**",
           ...summary.lines.map((line) => `・${line}`),
+          "",
+          `[🔗 IRkunで確認する](https://irkun.vercel.app/)`,
         ].join("\n"),
         footer: {
           text: "⚠️ このサマリーはAI生成です。投資推奨ではありません。",
