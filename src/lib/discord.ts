@@ -1,23 +1,18 @@
 /**
  * Discord Webhook 通知クライアント
  *
- * むーさんのDiscordに開示情報とAIサマリーを送信する。
+ * EDINETデータを構造化Embedで通知する（Claude API不要）。
  */
 
-import type { DiscordNotification } from "@/types";
+import type { DiscordNotification, EdinetEarnings, EdinetCompany } from "@/types";
+import { formatMillionJpy, formatSign } from "@/lib/summary";
 
-/**
- * Discord Embed の色コード（センチメント別）
- */
 const SENTIMENT_COLORS = {
   positive: 0x00c851, // 緑
   negative: 0xff4444, // 赤
-  neutral: 0x33b5e5,  // 青
+  neutral: 0x33b5e5, // 青
 } as const;
 
-/**
- * 開示の種別アイコンマップ
- */
 function getDocTypeEmoji(docType: string): string {
   if (docType.includes("決算") || docType.includes("業績")) return "📊";
   if (docType.includes("配当")) return "💰";
@@ -28,21 +23,93 @@ function getDocTypeEmoji(docType: string): string {
 }
 
 /**
+ * 業績データをEmbed fieldテキストに変換
+ */
+function buildEarningsField(e: EdinetEarnings): string {
+  const parts: string[] = [];
+
+  if (e.revenue != null) {
+    const yoy =
+      e.revenueYoy != null ? ` (${formatSign(e.revenueYoy)}%)` : "";
+    parts.push(`売上高: **${formatMillionJpy(e.revenue)}**${yoy}`);
+  }
+  if (e.operatingProfit != null) {
+    const yoy =
+      e.operatingProfitYoy != null
+        ? ` (${formatSign(e.operatingProfitYoy)}%)`
+        : "";
+    parts.push(`営業利益: **${formatMillionJpy(e.operatingProfit)}**${yoy}`);
+  }
+  if (e.netProfit != null) {
+    parts.push(`純利益: **${formatMillionJpy(e.netProfit)}**`);
+  }
+  if (e.eps != null) {
+    parts.push(`EPS: **${e.eps}円**`);
+  }
+
+  return parts.length > 0 ? parts.join("\n") : "データなし";
+}
+
+/**
+ * 通期予想テキストを構築
+ */
+function buildForecastField(e: EdinetEarnings): string | null {
+  if (!e.forecast) return null;
+  return e.forecast;
+}
+
+/**
+ * 企業情報をEmbed fieldテキストに変換
+ */
+function buildCompanyField(c: EdinetCompany): string {
+  const parts: string[] = [];
+
+  if (c.industry) parts.push(`業種: ${c.industry}`);
+  if (c.healthScore != null) parts.push(`財務健全性: ${c.healthScore}/100`);
+  if (c.roe != null) parts.push(`ROE: ${c.roe}%`);
+  if (c.per != null) parts.push(`PER: ${c.per}倍`);
+  if (c.dividendYield != null) parts.push(`配当利回り: ${c.dividendYield}%`);
+
+  return parts.length > 0 ? parts.join("\n") : "データなし";
+}
+
+/**
+ * リンク集テキストを構築
+ */
+function buildLinksField(
+  earnings?: EdinetEarnings,
+  company?: EdinetCompany,
+  docUrl?: string,
+  midtermPdfs?: { url: string; title: string }[],
+): string {
+  const links: string[] = [];
+
+  if (docUrl) links.push(`[📄 開示原文](${docUrl})`);
+  if (earnings?.pdfUrl) links.push(`[📑 決算短信PDF](${earnings.pdfUrl})`);
+  if (company?.textBlocksUrl)
+    links.push(`[📋 EDINET DB テキスト](${company.textBlocksUrl})`);
+  if (midtermPdfs) {
+    for (const pdf of midtermPdfs) {
+      links.push(`[📘 ${pdf.title}](${pdf.url})`);
+    }
+  }
+
+  return links.length > 0 ? links.join("\n") : "リンクなし";
+}
+
+/**
  * Discord Webhook にIRアラートを送信
- *
- * @param notification - 開示情報 + AIサマリー
  */
 export async function sendDiscordNotification(
-  notification: DiscordNotification
+  notification: DiscordNotification,
 ): Promise<void> {
   const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
   if (!webhookUrl) throw new Error("DISCORD_WEBHOOK_URL is not set");
 
-  const { disclosure, summary } = notification;
+  const { disclosure, summary, earnings, company, midtermPdfs } = notification;
   const emoji = getDocTypeEmoji(disclosure.docType);
   const color = SENTIMENT_COLORS[summary.sentiment];
 
-  // 公開日時（JST）
   const publishedJst = disclosure.publishedAt.toLocaleString("ja-JP", {
     timeZone: "Asia/Tokyo",
     year: "numeric",
@@ -52,7 +119,40 @@ export async function sendDiscordNotification(
     minute: "2-digit",
   });
 
-  // Discord Embed フォーマット
+  // Embed fields を構築
+  const fields: { name: string; value: string; inline?: boolean }[] = [];
+
+  if (earnings) {
+    fields.push({
+      name: `📈 業績（${earnings.fiscalYear || "直近"}）`,
+      value: buildEarningsField(earnings),
+    });
+
+    const forecast = buildForecastField(earnings);
+    if (forecast) {
+      fields.push({
+        name: "📊 通期予想",
+        value: forecast,
+      });
+    }
+  }
+
+  if (company) {
+    fields.push({
+      name: "🏢 企業情報",
+      value: buildCompanyField(company),
+      inline: true,
+    });
+  }
+
+  const linksText = buildLinksField(earnings, company, disclosure.docUrl, midtermPdfs);
+  if (linksText !== "リンクなし") {
+    fields.push({
+      name: "🔗 リンク",
+      value: linksText,
+    });
+  }
+
   const payload = {
     embeds: [
       {
@@ -64,19 +164,14 @@ export async function sendDiscordNotification(
         description: [
           `📅 **公開日時**: ${publishedJst}`,
           `🏷 **種別**: ${disclosure.docType}`,
-          "",
-          "**📝 3行サマリー**",
-          ...summary.lines.map((line) => `・${line}`),
-          "",
-          `[🔗 IRkunで確認する](https://irkun.vercel.app/)`,
+          `📡 **ソース**: ${disclosure.source === "edinet" ? "EDINET" : "TDNet"}`,
         ].join("\n"),
+        fields,
         footer: {
-          text: "⚠️ このサマリーはAI生成です。投資推奨ではありません。",
+          text: "EDINET DB データに基づく通知です。投資判断はご自身の責任で行ってください。",
         },
         timestamp: disclosure.publishedAt.toISOString(),
-        ...(disclosure.docUrl
-          ? { url: disclosure.docUrl }
-          : {}),
+        ...(disclosure.docUrl ? { url: disclosure.docUrl } : {}),
       },
     ],
   };
@@ -90,7 +185,7 @@ export async function sendDiscordNotification(
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(
-      `Discord Webhook failed: ${res.status} ${res.statusText} — ${body}`
+      `Discord Webhook failed: ${res.status} ${res.statusText} — ${body}`,
     );
   }
 }

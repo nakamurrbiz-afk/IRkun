@@ -7,7 +7,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import type { TDNetDisclosure, EdinetEarnings, IrSummary } from "@/types";
+import type { TDNetDisclosure, EdinetEarnings, IrSummary, IrSection } from "@/types";
 
 const client = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -17,7 +17,7 @@ const MODEL = "claude-sonnet-4-5";
 
 // キャッシュ対象のシステムプロンプト（繰り返し呼び出し時にトークン節約）
 const SYSTEM_PROMPT = `あなたは日本株の投資家向けIRアナリストです。
-適時開示・決算短信の内容を受け取り、投資判断に役立つ3行サマリーを作成します。
+適時開示・決算短信・IR資料の内容を受け取り、投資判断に役立つ3行サマリーを作成します。
 
 ## 出力ルール
 - 必ず3行（箇条書き）で出力する
@@ -42,10 +42,11 @@ const SYSTEM_PROMPT = `あなたは日本株の投資家向けIRアナリスト�
  */
 export async function generateIrSummary(
   disclosure: TDNetDisclosure,
-  earnings: EdinetEarnings | null
+  earnings: EdinetEarnings | null,
+  irSections?: IrSection[]
 ): Promise<IrSummary> {
   // ユーザーメッセージを構築
-  const userContent = buildUserContent(disclosure, earnings);
+  const userContent = buildUserContent(disclosure, earnings, irSections);
 
   const response = await client.messages.create({
     model: MODEL,
@@ -77,7 +78,8 @@ export async function generateIrSummary(
  */
 function buildUserContent(
   disclosure: TDNetDisclosure,
-  earnings: EdinetEarnings | null
+  earnings: EdinetEarnings | null,
+  irSections?: IrSection[]
 ): string {
   const lines: string[] = [
     `【開示情報】`,
@@ -114,6 +116,19 @@ function buildUserContent(
     }
     if (earnings.forecast) {
       lines.push(`来期予想: ${earnings.forecast}`);
+    }
+  }
+
+  if (irSections && irSections.length > 0) {
+    lines.push(``, `【IR資料（EDINET DB）】`);
+    for (const section of irSections.slice(0, 3)) {
+      lines.push(`--- ${section.title} (${section.sectionType}) ---`);
+      // トークン節約のため長いセクションは切り詰め
+      const content =
+        section.content.length > 2000
+          ? section.content.slice(0, 2000) + "…（以下省略）"
+          : section.content;
+      lines.push(content);
     }
   }
 

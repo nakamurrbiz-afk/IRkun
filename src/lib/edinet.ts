@@ -9,12 +9,19 @@
  * 使用するのはウォッチリストマッチ時のみ。Freeプラン 100req/日 を守る。
  */
 
-import type { EdinetCompany, EdinetEarnings } from "@/types";
+import type { EdinetCompany, EdinetEarnings, EdinetEvent, IrSection } from "@/types";
+import { formatMillionJpy } from "@/lib/summary";
 
 const EDINET_MCP_URL = "https://edinetdb.jp/mcp";
 
 // リクエストIDのカウンター（セッション内で一意であれば十分）
 let requestId = 1;
+
+// ── セッションキャッシュ（ポーリングサイクル内で再利用）────────────
+let cachedSession: { id: string | null; expiresAt: number } | null = null;
+
+// ── 証券コード → EDINETコード キャッシュ ─────────────────────────
+const edinetCodeCache = new Map<string, string>();
 
 /**
  * MCPセッションを初期化してセッションIDを取得する
@@ -108,72 +115,263 @@ async function callTool(
   }
 }
 
+// ── セッションID取得（キャッシュ再利用） ─────────────────────────
+
+async function getSession(): Promise<string | null> {
+  if (cachedSession && Date.now() < cachedSession.expiresAt) {
+    return cachedSession.id;
+  }
+  const id = await initSession();
+  cachedSession = { id, expiresAt: Date.now() + 50 * 60 * 1000 };
+  return id;
+}
+
+// ── 証券コード → EDINETコード変換 ───────────────────────────────
+
 /**
- * 企業の決算短信データを取得（TDNet速報）
- * 決算系の開示にマッチした際に呼び出す。
+ * 証券コード（4桁）→ EDINETコード変換
+ * search_companies で解決し、結果をキャッシュ
+ */
+export async function resolveEdinetCode(
+  secCode: string
+): Promise<string | null> {
+  if (edinetCodeCache.has(secCode)) return edinetCodeCache.get(secCode)!;
+
+  const sessionId = await getSession();
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data: any = await callTool(
+      "search_companies",
+      { query: secCode, limit: 1 },
+      sessionId
+    );
+    if (!data) return null;
+
+    const results = Array.isArray(data)
+      ? data
+      : (data.results ?? data.companies ?? []);
+    if (results.length === 0) return null;
+
+    const code: string | undefined =
+      results[0]?.edinetCode ?? results[0]?.edinet_code;
+    if (code) edinetCodeCache.set(secCode, code);
+    return code ?? null;
+  } catch (err) {
+    console.warn(`[edinet] resolveEdinetCode(${secCode}) failed:`, err);
+    return null;
+  }
+}
+
+// ── get_events: 企業イベント取得 ────────────────────────────────
+
+/**
+ * 企業イベントを取得（TDNet/EDINET/JPX 統合）
+ * sec_code でフィルタ可能。指定なしで全銘柄を返す。
+ */
+export async function getEvents(options?: {
+  secCode?: string;
+  since?: string;
+  until?: string;
+  eventCategory?: string;
+  severity?: string;
+  limit?: number;
+}): Promise<EdinetEvent[]> {
+  const sessionId = await getSession();
+
+  const args: Record<string, unknown> = {};
+  if (options?.secCode) args.sec_code = options.secCode;
+  if (options?.since) args.since = options.since;
+  if (options?.until) args.until = options.until;
+  if (options?.eventCategory) args.event_category = options.eventCategory;
+  if (options?.severity) args.severity = options.severity;
+  if (options?.limit) args.limit = options.limit;
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data: any = await callTool("get_events", args, sessionId);
+    if (!data) return [];
+
+    const events = Array.isArray(data)
+      ? data
+      : (data.events ?? data.results ?? []);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return events.map((e: any) => ({
+      secCode: String(e.sec_code ?? e.secCode ?? ""),
+      edinetCode: String(e.edinet_code ?? e.edinetCode ?? ""),
+      companyName: String(e.company_name ?? e.companyName ?? ""),
+      eventType: String(e.event_type ?? e.eventType ?? ""),
+      eventCategory: String(e.event_category ?? e.eventCategory ?? ""),
+      severity: (e.severity as EdinetEvent["severity"]) ?? "medium",
+      title: String(e.title ?? e.event_title ?? ""),
+      publishedAt: String(
+        e.published_at ?? e.publishedAt ?? e.event_date ?? ""
+      ),
+      source: String(e.source ?? "edinet"),
+    }));
+  } catch (err) {
+    console.warn("[edinet] getEvents failed:", err);
+    return [];
+  }
+}
+
+// ── get_earnings: 決算短信データ取得（修正版） ──────────────────
+
+/**
+ * 企業の決算短信データを取得
+ * 証券コード（4桁）→ EDINETコードに変換してから取得する。
  */
 export async function getEarnings(
-  companyCode: string
+  secCode: string
 ): Promise<EdinetEarnings | null> {
-  const sessionId = await initSession();
+  const edinetCode = await resolveEdinetCode(secCode);
+  if (!edinetCode) {
+    console.warn(`[edinet] getEarnings: EDINETコード未解決 (${secCode})`);
+    return null;
+  }
+
+  const sessionId = await getSession();
 
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const data: any = await callTool(
       "get_earnings",
-      { company_code: companyCode },
+      { edinet_code: edinetCode },
       sessionId
     );
 
     if (!data) return null;
 
+    // get_earnings は配列を返す場合がある
+    const entries = Array.isArray(data)
+      ? data
+      : (data.earnings ?? data.results ?? [data]);
+    if (entries.length === 0) return null;
+
+    const latest = entries[0];
+
+    // 来期予想テキストを構築（百万円 → 読みやすい金額に変換）
+    const forecastParts: string[] = [];
+    if (latest.forecastRevenue != null)
+      forecastParts.push(`売上予想: ${formatMillionJpy(latest.forecastRevenue)}`);
+    if (latest.forecastOperatingIncome != null)
+      forecastParts.push(
+        `営業利益予想: ${formatMillionJpy(latest.forecastOperatingIncome)}`
+      );
+    if (latest.forecastNetIncome != null)
+      forecastParts.push(`純利益予想: ${formatMillionJpy(latest.forecastNetIncome)}`);
+    if (latest.forecastEps != null)
+      forecastParts.push(`EPS予想: ${latest.forecastEps}円`);
+
     return {
-      companyCode,
-      companyName: data.company_name ?? data.companyName ?? "",
-      fiscalYear: data.fiscal_year ?? data.fiscalYear ?? "",
-      revenue: data.revenue ?? data.sales ?? undefined,
-      revenueYoy: data.revenue_yoy ?? data.salesYoy ?? undefined,
-      operatingProfit: data.operating_profit ?? data.operatingProfit ?? undefined,
+      companyCode: secCode,
+      companyName: latest.name ?? latest.company_name ?? "",
+      fiscalYear: latest.title ?? latest.fiscalYearEnd ?? latest.fiscal_year ?? "",
+      revenue: latest.revenue ?? undefined,
+      revenueYoy: latest.revenueChange ?? latest.revenue_yoy ?? undefined,
+      operatingProfit: latest.operatingIncome ?? latest.operating_income ?? undefined,
       operatingProfitYoy:
-        data.operating_profit_yoy ?? data.operatingProfitYoy ?? undefined,
-      netProfit: data.net_profit ?? data.netProfit ?? undefined,
-      eps: data.eps ?? undefined,
-      forecast: data.forecast ?? data.outlook ?? undefined,
+        latest.operatingIncomeChange ?? latest.operating_income_change ?? undefined,
+      netProfit: latest.netIncome ?? latest.net_income ?? undefined,
+      eps: latest.eps ?? undefined,
+      forecast:
+        forecastParts.length > 0
+          ? forecastParts.join("、")
+          : undefined,
+      pdfUrl: latest.pdfUrl ?? latest.pdf_url ?? undefined,
     };
   } catch (err) {
-    // EDINET DBにまだデータがない場合は null を返して続行
-    console.warn(`[edinet] getEarnings(${companyCode}) failed:`, err);
+    console.warn(`[edinet] getEarnings(${secCode}) failed:`, err);
     return null;
   }
 }
 
+// ── get_ir_sections: IR資料セクション取得 ───────────────────────
+
+/**
+ * IR資料セクションを取得（最新PDFの内容）
+ * 中期経営計画・統合報告書などの戦略コンテンツを返す
+ */
+export async function getIrSections(
+  secCode: string,
+  options?: { latestN?: number; pdfType?: string }
+): Promise<IrSection[]> {
+  const edinetCode = await resolveEdinetCode(secCode);
+  if (!edinetCode) return [];
+
+  const sessionId = await getSession();
+
+  try {
+    const args: Record<string, unknown> = { edinet_code: edinetCode };
+    if (options?.latestN) args.latest_n = options.latestN;
+    else args.latest_n = 1;
+    if (options?.pdfType) args.pdf_type = options.pdfType;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data: any = await callTool(
+      "get_ir_sections_by_company",
+      args,
+      sessionId
+    );
+    if (!data) return [];
+
+    const sections = Array.isArray(data)
+      ? data
+      : (data.sections ?? data.results ?? []);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return sections.map((s: any) => ({
+      sectionType: String(s.section_type ?? s.sectionType ?? ""),
+      title: String(s.heading ?? s.title ?? s.section_title ?? ""),
+      content: String(s.body ?? s.content ?? s.text ?? ""),
+      pdfType: (s.pdf_type ?? s.pdfType) as string | undefined,
+      pdfUrl: (s.pdf_url ?? s.pdfUrl) as string | undefined,
+      pdfTitle: (s.pdf_title ?? s.pdfTitle) as string | undefined,
+      publishedAt: (s.pdf_discovered_at ?? s.published_at) as string | undefined,
+    }));
+  } catch (err) {
+    console.warn(`[edinet] getIrSections(${secCode}) failed:`, err);
+    return [];
+  }
+}
+
+// ── get_company: 企業基本情報取得（修正版） ─────────────────────
+
 /**
  * 企業の基本情報を取得
+ * 証券コード（4桁）→ EDINETコードに変換してから取得する。
  */
 export async function getCompany(
-  companyCode: string
+  secCode: string
 ): Promise<EdinetCompany | null> {
-  const sessionId = await initSession();
+  const edinetCode = await resolveEdinetCode(secCode);
+  if (!edinetCode) return null;
+
+  const sessionId = await getSession();
 
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const data: any = await callTool(
       "get_company",
-      { company_code: companyCode },
+      { edinet_code: edinetCode },
       sessionId
     );
 
     if (!data) return null;
 
     return {
-      companyCode,
-      companyName: data.company_name ?? data.companyName ?? "",
+      companyCode: secCode,
+      companyName: data.name ?? data.company_name ?? "",
       industry: data.industry ?? data.sector ?? "",
       marketCap: data.market_cap ?? data.marketCap ?? undefined,
-      healthScore: data.health_score ?? data.healthScore ?? undefined,
+      healthScore: data.healthScore ?? data.health_score ?? undefined,
+      roe: data.roe ?? undefined,
+      per: data.per ?? undefined,
+      dividendYield: data.dividendYield ?? data.dividend_yield ?? undefined,
+      textBlocksUrl: data.textBlocksUrl ?? data.text_blocks_url ?? undefined,
     };
   } catch (err) {
-    console.warn(`[edinet] getCompany(${companyCode}) failed:`, err);
+    console.warn(`[edinet] getCompany(${secCode}) failed:`, err);
     return null;
   }
 }

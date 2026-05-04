@@ -4,9 +4,11 @@
  * GitHub Actions Cron から30分ごとに呼び出されるメインポーリングエンドポイント。
  * 処理フロー:
  *   1. Supabase からウォッチリストを取得（未設定時は .env にフォールバック）
- *   2. やのしん TDNet API で直近35分の開示を取得
+ *   2a. やのしん TDNet API で直近35分の開示を取得
+ *   2b. EDINET DB get_events で当日のイベントを取得（critical/high）
+ *   2c. 両ソースをマージ
  *   3. ウォッチリストとマッチング
- *   4. 各マッチに対して: 重複チェック → EDINET補完 → Claude要約 → Discord通知 → DB保存
+ *   4. 各マッチに対して: 重複チェック → EDINET補完(決算+企業情報) → 構造化サマリー → Discord通知 → DB保存
  *   5. 処理結果を JSON で返す
  *
  * セキュリティ: x-cron-secret ヘッダーで認証
@@ -15,11 +17,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getWatchlistCodes, isWatched } from "@/lib/watchlist";
 import { getRecentDisclosures, isEarningsType } from "@/lib/tdnet";
-import { getEarnings } from "@/lib/edinet";
-import { generateIrSummary } from "@/lib/claude";
+import { getEarnings, getEvents, getCompany, getIrSections } from "@/lib/edinet";
+import { buildIrSummary } from "@/lib/summary";
 import { sendDiscordNotification } from "@/lib/discord";
 import { supabase } from "@/lib/supabase";
-import type { PollResult } from "@/types";
+import type { PollResult, TDNetDisclosure } from "@/types";
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   // ── セキュリティ: Cron Secretの検証 ──────────────────────────────
@@ -62,20 +64,51 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     });
   }
 
-  // ── Step 2: TDNet から直近35分の開示を取得 ────────────────────────
-  let disclosures;
+  // ── Step 2a: TDNet から直近35分の開示を取得 ──────────────────────
+  let tdnetDisclosures: TDNetDisclosure[] = [];
   try {
-    disclosures = await getRecentDisclosures();
+    tdnetDisclosures = await getRecentDisclosures();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    result.errors.push(`TDNet fetch error: ${msg}`);
-    return NextResponse.json(result, { status: 500 });
+    result.errors.push(`TDNet: ${msg}`);
   }
 
-  result.totalDisclosures = disclosures.length;
+  // ── Step 2b: EDINET DB から当日のイベントを取得 ──────────────────
+  let edinetDisclosures: TDNetDisclosure[] = [];
+  try {
+    const yesterday = new Date(Date.now() - 86400000)
+      .toISOString()
+      .slice(0, 10);
+    const events = await getEvents({
+      since: yesterday,
+      severity: "critical,high",
+      limit: 100,
+    });
+    edinetDisclosures = events
+      .filter((e) => e.secCode && isWatched(e.secCode, watchlist))
+      .map((e) => ({
+        companyCode: e.secCode,
+        companyName: e.companyName,
+        docTitle: e.title,
+        docType: e.eventType || e.eventCategory,
+        publishedAt: new Date(e.publishedAt),
+        docUrl: "",
+        source: "edinet" as const,
+      }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    result.errors.push(`EDINET: ${msg}`);
+  }
+
+  // ── Step 2c: 両ソースをマージ ───────────────────────────────────
+  const allDisclosures: TDNetDisclosure[] = [
+    ...tdnetDisclosures.map((d) => ({ ...d, source: "tdnet" as const })),
+    ...edinetDisclosures,
+  ];
+  result.totalDisclosures = allDisclosures.length;
 
   // ── Step 3: ウォッチリストとマッチング ───────────────────────────
-  const matched = disclosures.filter((d) =>
+  const matched = allDisclosures.filter((d) =>
     isWatched(d.companyCode, watchlist)
   );
   result.matchedCount = matched.length;
@@ -104,19 +137,46 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         continue;
       }
 
-      // 決算系の開示なら EDINET DB で財務データを補完
-      const earnings = isEarningsType(disclosure.docType)
+      // 決算系の開示なら EDINET DB で財務データ + 企業情報を補完
+      const isEarnings = isEarningsType(disclosure.docType);
+      const earnings = isEarnings
         ? await getEarnings(disclosure.companyCode)
         : null;
+      const company = await getCompany(disclosure.companyCode);
 
-      // Claude API で3行サマリーを生成
-      const summary = await generateIrSummary(disclosure, earnings);
+      // 中期経営計画 PDF を取得（非致命的）
+      let midtermPdfs: { url: string; title: string }[] | undefined;
+      try {
+        const sections = await getIrSections(disclosure.companyCode, {
+          pdfType: "midterm",
+          latestN: 1,
+        });
+        const seen = new Set<string>();
+        const pdfs: { url: string; title: string }[] = [];
+        for (const s of sections) {
+          if (s.pdfUrl && !seen.has(s.pdfUrl)) {
+            seen.add(s.pdfUrl);
+            pdfs.push({ url: s.pdfUrl, title: s.pdfTitle || "中期経営計画" });
+          }
+        }
+        if (pdfs.length > 0) midtermPdfs = pdfs;
+      } catch (err) {
+        console.warn(
+          `[poll] midterm PDF fetch failed for ${disclosure.companyCode}:`,
+          err,
+        );
+      }
+
+      // EDINET データから構造化サマリーを生成（Claude API 不要）
+      const summary = buildIrSummary(disclosure, earnings, company);
 
       // Discord Webhook に通知
       await sendDiscordNotification({
         disclosure,
         summary,
         earnings: earnings ?? undefined,
+        company: company ?? undefined,
+        midtermPdfs,
       });
 
       // Supabase に通知履歴を保存（重複防止 + UI表示用）
