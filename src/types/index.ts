@@ -1,13 +1,14 @@
 // TDNet（東証適時開示）からの開示情報
 export interface TDNetDisclosure {
-  companyCode: string;       // 証券コード（例: "7203"）
+  companyCode: string;       // 証券コード（例: "7203"）またはティッカー（例: "AAPL"）
   companyName: string;       // 会社名（例: "トヨタ自動車株式会社"）
   docTitle: string;          // 開示タイトル
   docType: string;           // 種別（例: "決算短信", "適時開示"）
   publishedAt: Date;         // 公開日時
   docUrl: string;            // 原文URL（TDNet viewer）
   xbrlUrl?: string;          // XBRLデータURL（あれば）
-  source?: "tdnet" | "edinet"; // データソース
+  source?: "tdnet" | "edinet" | "fmp"; // データソース
+  market?: "jp" | "overseas"; // マーケット区分
 }
 
 // EDINET DB から取得した決算短信データ
@@ -77,6 +78,9 @@ export interface DiscordNotification {
   earnings?: EdinetEarnings;
   company?: EdinetCompany;
   midtermPdfs?: { url: string; title: string }[];
+  // Overseas（FMP + SEC EDGAR）
+  overseasProfile?: import("@/types/overseas").FmpCompanyProfile;
+  edgarFinancials?: import("@/lib/edgar").EdgarFinancials;
 }
 
 // ポーリング結果レポート

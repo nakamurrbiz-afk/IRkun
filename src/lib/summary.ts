@@ -11,6 +11,9 @@ import type {
   EdinetCompany,
   IrSummary,
 } from "@/types";
+import type { FmpCompanyProfile } from "@/types/overseas";
+import type { EdgarFinancials } from "@/lib/edgar";
+import { formatUsd } from "@/lib/format-usd";
 
 /**
  * 百万円単位の値を読みやすい日本語金額に変換
@@ -109,4 +112,52 @@ export function buildIrSummary(
     earnings: earnings ?? undefined,
     company: company ?? undefined,
   };
+}
+
+/**
+ * 海外企業の FMP Profile + SEC EDGAR データから IrSummary を構築
+ */
+export function buildOverseasSummary(
+  disclosure: TDNetDisclosure,
+  edgar: EdgarFinancials | null,
+  profile: FmpCompanyProfile | null,
+): IrSummary {
+  const lines: string[] = [];
+
+  if (edgar) {
+    if (edgar.revenue != null) {
+      lines.push(`Revenue: **${formatUsd(edgar.revenue)}**`);
+    }
+    if (edgar.operatingIncome != null) {
+      lines.push(`Operating Income: **${formatUsd(edgar.operatingIncome)}**`);
+    }
+    if (edgar.netIncome != null) {
+      lines.push(`Net Income: **${formatUsd(edgar.netIncome)}**`);
+    }
+    if (edgar.epsDiluted != null) {
+      lines.push(`EPS (diluted): **$${edgar.epsDiluted.toFixed(2)}**`);
+    }
+    if (edgar.period) {
+      lines.push(`Period: ${edgar.period}`);
+    }
+  }
+
+  if (profile) {
+    if (profile.sector) lines.push(`Sector: ${profile.sector}`);
+    if (profile.mktCap != null) lines.push(`Market Cap: ${formatUsd(profile.mktCap)}`);
+    if (profile.country) lines.push(`Country: ${profile.country}`);
+  }
+
+  if (lines.length === 0) {
+    lines.push(`${disclosure.companyName} disclosure detected`);
+  }
+
+  // センチメント判定（営業利益率ベース）
+  let sentiment: IrSummary["sentiment"] = "neutral";
+  if (edgar?.revenue && edgar?.operatingIncome) {
+    const margin = edgar.operatingIncome / edgar.revenue;
+    sentiment = margin > 0.15 ? "positive" : margin < 0 ? "negative" : "neutral";
+  }
+
+  return { lines, sentiment };
 }

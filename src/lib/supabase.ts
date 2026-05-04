@@ -22,10 +22,13 @@ export const supabase = createClient(supabaseUrl, supabaseServiceKey, {
 
 // ── 型定義 ────────────────────────────────────────────────
 
+export type Market = "jp" | "overseas";
+
 export interface WatchlistRow {
   id: string;
   company_code: string;
   company_name: string;
+  market: Market;
   created_at: string;
 }
 
@@ -33,6 +36,7 @@ export interface NotificationRow {
   id: string;
   company_code: string;
   company_name: string;
+  market: Market;
   doc_title: string;
   doc_type: string;
   doc_url: string;

@@ -1,11 +1,15 @@
 /**
  * Discord Webhook 通知クライアント
  *
- * EDINETデータを構造化Embedで通知する（Claude API不要）。
+ * JP: EDINETデータを構造化Embedで通知
+ * Overseas: FMPデータを英語Embedで通知
  */
 
 import type { DiscordNotification, EdinetEarnings, EdinetCompany } from "@/types";
+import type { FmpCompanyProfile } from "@/types/overseas";
+import type { EdgarFinancials } from "@/lib/edgar";
 import { formatMillionJpy, formatSign } from "@/lib/summary";
+import { formatUsd } from "@/lib/format-usd";
 
 const SENTIMENT_COLORS = {
   positive: 0x00c851, // 緑
@@ -13,7 +17,12 @@ const SENTIMENT_COLORS = {
   neutral: 0x33b5e5, // 青
 } as const;
 
-function getDocTypeEmoji(docType: string): string {
+function getDocTypeEmoji(docType: string, market?: string): string {
+  if (market === "overseas") {
+    if (docType.includes("Earnings")) return "📊";
+    if (docType.includes("Press")) return "📰";
+    return "📋";
+  }
   if (docType.includes("決算") || docType.includes("業績")) return "📊";
   if (docType.includes("配当")) return "💰";
   if (docType.includes("合併") || docType.includes("買収")) return "🤝";
@@ -22,9 +31,8 @@ function getDocTypeEmoji(docType: string): string {
   return "📋";
 }
 
-/**
- * 業績データをEmbed fieldテキストに変換
- */
+// ── JP 用フィールドビルダー ─────────────────────────────────────
+
 function buildEarningsField(e: EdinetEarnings): string {
   const parts: string[] = [];
 
@@ -50,17 +58,11 @@ function buildEarningsField(e: EdinetEarnings): string {
   return parts.length > 0 ? parts.join("\n") : "データなし";
 }
 
-/**
- * 通期予想テキストを構築
- */
 function buildForecastField(e: EdinetEarnings): string | null {
   if (!e.forecast) return null;
   return e.forecast;
 }
 
-/**
- * 企業情報をEmbed fieldテキストに変換
- */
 function buildCompanyField(c: EdinetCompany): string {
   const parts: string[] = [];
 
@@ -73,9 +75,6 @@ function buildCompanyField(c: EdinetCompany): string {
   return parts.length > 0 ? parts.join("\n") : "データなし";
 }
 
-/**
- * リンク集テキストを構築
- */
 function buildLinksField(
   earnings?: EdinetEarnings,
   company?: EdinetCompany,
@@ -94,8 +93,71 @@ function buildLinksField(
     }
   }
 
-  return links.length > 0 ? links.join("\n") : "リンクなし";
+  return links.length > 0 ? links.join("\n") : "";
 }
+
+// ── Overseas 用フィールドビルダー ───────────────────────────────
+
+function buildEdgarEarningsField(edgar: EdgarFinancials): string {
+  const parts: string[] = [];
+
+  if (edgar.revenue != null) {
+    parts.push(`Revenue: **${formatUsd(edgar.revenue)}**`);
+  }
+  if (edgar.operatingIncome != null) {
+    parts.push(`Operating Income: **${formatUsd(edgar.operatingIncome)}**`);
+  }
+  if (edgar.netIncome != null) {
+    parts.push(`Net Income: **${formatUsd(edgar.netIncome)}**`);
+  }
+  if (edgar.epsDiluted != null) {
+    parts.push(`EPS (diluted): **$${edgar.epsDiluted.toFixed(2)}**`);
+  }
+  if (edgar.period) {
+    parts.push(`Period: ${edgar.period}`);
+  }
+
+  return parts.length > 0 ? parts.join("\n") : "No data";
+}
+
+function buildOverseasProfileField(p: FmpCompanyProfile): string {
+  const parts: string[] = [];
+
+  if (p.sector) parts.push(`Sector: ${p.sector}`);
+  if (p.industry) parts.push(`Industry: ${p.industry}`);
+  if (p.mktCap != null) parts.push(`Market Cap: ${formatUsd(p.mktCap)}`);
+  if (p.country) parts.push(`Country: ${p.country}`);
+  if (p.exchange) parts.push(`Exchange: ${p.exchange}`);
+
+  return parts.length > 0 ? parts.join("\n") : "No data";
+}
+
+function buildOverseasLinksField(
+  profile?: FmpCompanyProfile,
+  edgar?: EdgarFinancials,
+  docUrl?: string,
+): string {
+  const links: string[] = [];
+  const symbol = profile?.symbol;
+
+  if (docUrl) links.push(`[📄 Filing](${docUrl})`);
+
+  // SEC EDGAR リンク（CIK から構築）
+  const cik = edgar?.cik ?? profile?.cik;
+  if (cik) {
+    const cleanCik = cik.replace(/^0+/, "");
+    links.push(`[🏛 SEC EDGAR](https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${cleanCik}&type=10-&dateb=&owner=include&count=5)`);
+  }
+
+  // Yahoo Finance 決算ページ
+  if (symbol) {
+    links.push(`[📊 Yahoo Finance](https://finance.yahoo.com/quote/${symbol}/financials/)`);
+  }
+
+  return links.length > 0 ? links.join("\n") : "";
+}
+
+// ── メイン通知関数 ───────────────────────────────────────────────
 
 /**
  * Discord Webhook にIRアラートを送信
@@ -106,69 +168,114 @@ export async function sendDiscordNotification(
   const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
   if (!webhookUrl) throw new Error("DISCORD_WEBHOOK_URL is not set");
 
-  const { disclosure, summary, earnings, company, midtermPdfs } = notification;
-  const emoji = getDocTypeEmoji(disclosure.docType);
+  const { disclosure, summary } = notification;
+  const isOverseas = disclosure.market === "overseas";
+
+  const emoji = getDocTypeEmoji(disclosure.docType, disclosure.market);
   const color = SENTIMENT_COLORS[summary.sentiment];
 
-  const publishedJst = disclosure.publishedAt.toLocaleString("ja-JP", {
-    timeZone: "Asia/Tokyo",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-
-  // Embed fields を構築
+  // ── Embed構築 ──────────────────────────────────────────────────
   const fields: { name: string; value: string; inline?: boolean }[] = [];
 
-  if (earnings) {
-    fields.push({
-      name: `📈 業績（${earnings.fiscalYear || "直近"}）`,
-      value: buildEarningsField(earnings),
-    });
+  if (isOverseas) {
+    // Overseas フォーマット
+    const { overseasProfile, edgarFinancials } = notification;
 
-    const forecast = buildForecastField(earnings);
-    if (forecast) {
+    if (edgarFinancials) {
       fields.push({
-        name: "📊 通期予想",
-        value: forecast,
+        name: `📈 Financials (${edgarFinancials.period || "Latest"})`,
+        value: buildEdgarEarningsField(edgarFinancials),
       });
+    }
+
+    if (overseasProfile) {
+      fields.push({
+        name: "🏢 Company Info",
+        value: buildOverseasProfileField(overseasProfile),
+        inline: true,
+      });
+    }
+
+    const linksText = buildOverseasLinksField(
+      overseasProfile,
+      edgarFinancials,
+      disclosure.docUrl,
+    );
+    if (linksText) {
+      fields.push({ name: "🔗 Links", value: linksText });
+    }
+  } else {
+    // JP フォーマット（従来どおり）
+    const { earnings, company, midtermPdfs } = notification;
+
+    if (earnings) {
+      fields.push({
+        name: `📈 業績（${earnings.fiscalYear || "直近"}）`,
+        value: buildEarningsField(earnings),
+      });
+      const forecast = buildForecastField(earnings);
+      if (forecast) {
+        fields.push({ name: "📊 通期予想", value: forecast });
+      }
+    }
+
+    if (company) {
+      fields.push({
+        name: "🏢 企業情報",
+        value: buildCompanyField(company),
+        inline: true,
+      });
+    }
+
+    const linksText = buildLinksField(earnings, company, disclosure.docUrl, midtermPdfs);
+    if (linksText) {
+      fields.push({ name: "🔗 リンク", value: linksText });
     }
   }
 
-  if (company) {
-    fields.push({
-      name: "🏢 企業情報",
-      value: buildCompanyField(company),
-      inline: true,
-    });
-  }
+  // ── 共通 Embed ─────────────────────────────────────────────────
+  const sourceLabel = isOverseas
+    ? "FMP"
+    : disclosure.source === "edinet"
+      ? "EDINET"
+      : "TDNet";
 
-  const linksText = buildLinksField(earnings, company, disclosure.docUrl, midtermPdfs);
-  if (linksText !== "リンクなし") {
-    fields.push({
-      name: "🔗 リンク",
-      value: linksText,
-    });
-  }
+  const publishedDisplay = disclosure.publishedAt.toLocaleString(
+    isOverseas ? "en-US" : "ja-JP",
+    {
+      timeZone: isOverseas ? "America/New_York" : "Asia/Tokyo",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    },
+  );
 
   const payload = {
     embeds: [
       {
         color,
         author: {
-          name: `${emoji} IRアラート｜${disclosure.companyName}（${disclosure.companyCode}）`,
+          name: `${emoji} IR Alert｜${disclosure.companyName}（${disclosure.companyCode}）`,
         },
         title: disclosure.docTitle,
-        description: [
-          `📅 **公開日時**: ${publishedJst}`,
-          `🏷 **種別**: ${disclosure.docType}`,
-          `📡 **ソース**: ${disclosure.source === "edinet" ? "EDINET" : "TDNet"}`,
-        ].join("\n"),
+        description: isOverseas
+          ? [
+              `📅 **Date**: ${publishedDisplay} ET`,
+              `🏷 **Type**: ${disclosure.docType}`,
+              `📡 **Source**: ${sourceLabel}`,
+            ].join("\n")
+          : [
+              `📅 **公開日時**: ${publishedDisplay}`,
+              `🏷 **種別**: ${disclosure.docType}`,
+              `📡 **ソース**: ${sourceLabel}`,
+            ].join("\n"),
         fields,
         footer: {
-          text: "EDINET DB データに基づく通知です。投資判断はご自身の責任で行ってください。",
+          text: isOverseas
+            ? "FMP data. Not investment advice."
+            : "EDINET DB データに基づく通知です。投資判断はご自身の責任で行ってください。",
         },
         timestamp: disclosure.publishedAt.toISOString(),
         ...(disclosure.docUrl ? { url: disclosure.docUrl } : {}),
